@@ -7,25 +7,28 @@ from datetime import datetime
 import pytz
 import psycopg2
 import plotly.graph_objects as go
-# ==========================================
-# 1. CONFIGURATION & DATABASE    streamlit run GammaDashboard.py
-# ==========================================
-# st.set_page_config(page_title="Institutional Gamma Command Center", layout="wide")
 
-CLIENT_ID = "1107312463"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzg2NzE4OTIyLCJpYXQiOjE3ODY2MzI1MjIsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA3MzEyNDYzIn0.k1vcpQc4-T-U411MxZV3CmoJuoZB53znydCnn5B2Ii67G_Sqb_gkwex6jKBFt-ItglJzgrPzz8nMQ39-IXwZnQ"
+# ==========================================
+# 1. CONFIGURATION & DATABASE (VIA SECRETS)
+# ==========================================
+st.set_page_config(page_title="Institutional Gamma Command Center", layout="wide")
+
+# Read from Streamlit Secrets with fallback to defaults
+CLIENT_ID = st.secrets.get("DHAN_CLIENT_ID", "DHAN_CLIENT_ID")
+ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "DHAN_ACCESS_TOKEN")
+EXPIRY_DATE = st.secrets.get("EXPIRY_DATE", "EXPIRY_DATE")
 
 UNDERLYING_SCRIP = 13  # Nifty 50
 UNDERLYING_SEG = "IDX_I" 
-EXPIRY_DATE = "2026-08-18" 
-LOT_SIZE = 65 
+LOT_SIZE = 65
 
 DB_CONFIG = {
-    "dbname": "gamma_db",
-    "user": "postgres",
-    "password": "root",
-    "host": "localhost",
-    "port": "5432"
+    "dbname": st.secrets.get("DB_NAME", "DB_NAME"),
+    "user": st.secrets.get("DB_USER", "DB_USER"),
+    "password": st.secrets.get("DB_PASSWORD", "DB_PASSWORD"),
+    "host": st.secrets.get("DB_HOST", "DB_HOST"),
+    "port": st.secrets.get("DB_PORT", "5432"),
+    "sslmode": "require" # Required for Cloud DBs like Neon/Supabase
 }
 
 
