@@ -1,11 +1,14 @@
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
+import json
 import math
 import time
 from datetime import datetime
 import pytz
 import psycopg2
+from psycopg2.extras import Json
 import plotly.graph_objects as go
 
 # ==========================================
@@ -32,65 +35,120 @@ DB_CONFIG = {
 }
 
 
+# ==========================================
+# 2. DATABASE MANAGEMENT & INITIALIZATION
+# ==========================================
+def get_db_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
 def init_db():
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS gamma_metrics (
+            CREATE TABLE IF NOT EXISTS market_snapshots_1m (
                 id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMP NOT NULL,
-                spot_price FLOAT,
-                zero_gamma FLOAT,
-                call_wall FLOAT,
-                put_wall FLOAT,
-                cw_velocity FLOAT,
-                pw_velocity FLOAT,
-                vol_skew FLOAT,
-                iv_vwap FLOAT
-            )
+                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+                spot_price NUMERIC(10, 2),
+                net_writer_delta NUMERIC(14, 2),
+                total_ce_oi NUMERIC(16, 2),
+                total_pe_oi NUMERIC(16, 2),
+                total_ce_oi_chg NUMERIC(16, 2),
+                total_pe_oi_chg NUMERIC(16, 2),
+                total_ce_vol NUMERIC(16, 2),
+                total_pe_vol NUMERIC(16, 2),
+                pcr_oi NUMERIC(6, 2),
+                pcr_vol NUMERIC(6, 2),
+                pcr_chg NUMERIC(6, 2),
+                macro_velocity NUMERIC(10, 2),
+                intraday_velocity NUMERIC(10, 2),
+                sd1_upper NUMERIC(10, 2),
+                sd1_lower NUMERIC(10, 2),
+                sd2_upper NUMERIC(10, 2),
+                sd2_lower NUMERIC(10, 2),
+                strike_details JSONB
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_time ON market_snapshots_1m (timestamp);
         """)
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        st.sidebar.warning(f"PostgreSQL Offline: DB Logging Disabled ({e})")
+        st.sidebar.error(f"DB Init Warning: {e}")
 
-def log_to_postgres(metrics):
+init_db()
+
+def log_snapshot_to_db(m):
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = get_db_connection()
         cur = conn.cursor()
         query = """
-            INSERT INTO gamma_metrics 
-            (timestamp, spot_price, zero_gamma, call_wall, put_wall, cw_velocity, pw_velocity, vol_skew, iv_vwap)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO market_snapshots_1m (
+                timestamp, spot_price, net_writer_delta, total_ce_oi, total_pe_oi,
+                total_ce_oi_chg, total_pe_oi_chg, total_ce_vol, total_pe_vol,
+                pcr_oi, pcr_vol, pcr_chg, macro_velocity, intraday_velocity,
+                sd1_upper, sd1_lower, sd2_upper, sd2_lower, strike_details
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
+        strike_json = m["strike_df"].to_dict(orient="records")
         values = (
-            datetime.now(), metrics['spot'], metrics['zero_gamma'], 
-            metrics['call_wall'], metrics['put_wall'], 0.0, 
-            0.0, metrics['vol_skew'], metrics['iv_vwap']
+            m["timestamp"], m["spot"], m["net_writer_delta"], m["total_ce_oi"], m["total_pe_oi"],
+            m["total_ce_oi_chg"], m["total_pe_oi_chg"], m["total_ce_vol"], m["total_pe_vol"],
+            m["pcr_oi"], m["pcr_vol"], m["pcr_chg"], m["vol_oi_velocity"], m["intra_vol_oi_velocity"],
+            m["sd1_upper"], m["sd1_lower"], m["sd2_upper"], m["sd2_lower"], Json(strike_json)
         )
         cur.execute(query, values)
         conn.commit()
         cur.close()
         conn.close()
+    except Exception as e:
+        st.sidebar.error(f"DB Write Error: {e}")
+
+def get_db_row_count():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM market_snapshots_1m;")
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return count
     except Exception:
-        pass
+        return 0
 
-init_db()
+def fetch_all_db_records():
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql_query("SELECT * FROM market_snapshots_1m ORDER BY timestamp ASC;", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def flush_database():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE market_snapshots_1m RESTART IDENTITY;")
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception:
+        return False
 
 # ==========================================
-# 2. SESSION STATE FOR ROLLING & DAILY METRICS
+# 3. SESSION STATE & SIDEBAR PARAMETERS
 # ==========================================
-ist = pytz.timezone('Asia/Kolkata')
+ist = pytz.timezone("Asia/Kolkata")
 current_date = datetime.now(ist).date()
 
-if 'oi_snapshots' not in st.session_state:
-    st.session_state.oi_snapshots = {}
-if 'vol_snapshots' not in st.session_state:
-    st.session_state.vol_snapshots = {}
+if "writer_history" not in st.session_state:
+    st.session_state.writer_history = []
+if "daily_baseline_oi" not in st.session_state:
+    st.session_state.daily_baseline_oi = {}
 
-# Daily PCR & Velocity Extrema Tracker + Dynamic OI Baseline
+# Daily Extrema Tracker
 if 'pcr_tracker' not in st.session_state or st.session_state.pcr_tracker.get('date') != current_date:
     st.session_state.pcr_tracker = {
         'date': current_date,
@@ -105,22 +163,63 @@ if 'pcr_tracker' not in st.session_state or st.session_state.pcr_tracker.get('da
         'intra_vel_max': {'val': 0.0, 'time': '--:--'},
         'intra_vel_min': {'val': 9999.0, 'time': '--:--'}
     }
-    st.session_state.daily_baseline_oi = {}
 
-def get_rolling_metric(snapshot_dict, strike_key, current_val, window_minutes=15):
-    current_time = time.time()
-    snapshots = snapshot_dict.setdefault(strike_key, [])
-    
-    snapshots.append({'time': current_time, 'val': current_val})
-    cutoff_time = current_time - (window_minutes * 60)
-    
-    snapshot_dict[strike_key] = [s for s in snapshots if s['time'] >= cutoff_time]
-    oldest_val = snapshot_dict[strike_key][0]['val']
-    
-    return max(0, current_val - oldest_val)
+st.sidebar.title("⚙️ Strategy Parameters")
+
+delta_interval = st.sidebar.select_slider(
+    "⏱️ Delta Interval (Minutes)",
+    options=[1, 2, 3, 5, 10, 15, 30],
+    value=5
+)
+
+ema_period = st.sidebar.number_input(
+    "📈 EMA Smoothing Period",
+    min_value=2,
+    max_value=100,
+    value=9,
+    step=1
+)
+
+strike_depth = st.sidebar.slider(
+    "🎯 Strike Range (± Points)",
+    min_value=100,
+    max_value=1000,
+    value=400,
+    step=50,
+    help="Restricts ALL calculations (PCRs, Velocities, Net Delta) to this specific zone."
+)
+
+# Database Management in Sidebar
+st.sidebar.markdown("---")
+st.sidebar.title("💾 Expiry Data Management")
+db_count = get_db_row_count()
+st.sidebar.info(f"📊 Stored Rows: **{db_count:,}** minutes")
+
+if st.sidebar.button("📥 Prepare Expiry Backup (CSV)"):
+    all_data = fetch_all_db_records()
+    if not all_data.empty:
+        all_data["strike_details"] = all_data["strike_details"].apply(json.dumps)
+        csv_data = all_data.to_csv(index=False).encode("utf-8")
+        st.sidebar.download_button(
+            label="💾 Download CSV Backup",
+            data=csv_data,
+            file_name=f"nifty_expiry_backup_{datetime.now(ist).strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.sidebar.warning("Database is currently empty.")
+
+st.sidebar.markdown("#### 🗑️ Flush Expiry Database")
+confirm_flush = st.sidebar.checkbox("Confirm: I have downloaded my backup")
+if st.sidebar.button("Flush Server DB", disabled=not confirm_flush):
+    if flush_database():
+        st.sidebar.success("Database truncated successfully!")
+        st.rerun()
+    else:
+        st.sidebar.error("Failed to flush database.")
 
 # ==========================================
-# 3. LIVE DHAN API FETCHING & PROCESSING
+# 4. DATA ENGINE (DHAN API FETCH)
 # ==========================================
 def fetch_option_chain():
     url = "https://api.dhan.co/v2/optionchain"
@@ -130,325 +229,281 @@ def fetch_option_chain():
         "Content-Type": "application/json"
     }
     payload = {
-        "UnderlyingScrip": UNDERLYING_SCRIP, 
-        "UnderlyingSeg": UNDERLYING_SEG, 
+        "UnderlyingScrip": UNDERLYING_SCRIP,
+        "UnderlyingSeg": UNDERLYING_SEG,
         "Expiry": EXPIRY_DATE
     }
-    
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response = requests.post(url, json=payload, headers=headers, timeout=8)
         if response.status_code == 200:
             return response.json()
-        else:
-            st.error(f"Dhan API Error ({response.status_code}): {response.text}")
-    except Exception as e:
-        st.error(f"API Connection Exception: {e}")
+    except Exception:
+        pass
+    return None
+
+def extract_val(opt_dict, keys):
+    for k in keys:
+        if k in opt_dict and opt_dict[k] is not None:
+            return float(opt_dict[k])
     return None
 
 def process_data():
     raw_data = fetch_option_chain()
-    if not raw_data or not raw_data.get('data'):
+    if not raw_data or not raw_data.get("data"):
         return None
-        
-    data = raw_data.get('data', {})
-    spot_price = data.get('last_price', 0)
-    option_chain = data.get('oc', {})
-    
-    chain_data = []
-    iv_sum = 0
-    iv_weighted_strike_sum = 0
-    
-    total_ce_oi, total_pe_oi = 0, 0
-    total_ce_oi_chg, total_pe_oi_chg = 0, 0
-    total_ce_vol, total_pe_vol = 0, 0
-    
-    total_ce_vol_15m, total_pe_vol_15m = 0, 0
-    
-    def extract_api_val(opt_dict, keys):
-        for key in keys:
-            if key in opt_dict:
-                return float(opt_dict[key])
-        return None
-    
+
+    data = raw_data.get("data", {})
+    spot_price = float(data.get("last_price", 0))
+    option_chain = data.get("oc", {})
+
+    total_ce_oi, total_pe_oi = 0.0, 0.0
+    total_ce_oi_chg, total_pe_oi_chg = 0.0, 0.0
+    total_ce_vol, total_pe_vol = 0.0, 0.0
+    strike_rows = []
+
+    atm_strike = round(spot_price / 50) * 50
+    atm_ce_iv = 0.0
+    atm_pe_iv = 0.0
+
     for strike_str, details in option_chain.items():
         strike = float(strike_str)
         
-        if not (spot_price - 500 <= strike <= spot_price + 500):
+        # 🎯 STRICT FILTER: Only calculate metrics for strikes within the selected range
+        if not (spot_price - strike_depth <= strike <= spot_price + strike_depth):
             continue
-            
-        ce = details.get('ce', {})
-        pe = details.get('pe', {})
-        
-        ce_oi = ce.get('oi', 0)
-        ce_gamma = ce.get('greeks', {}).get('gamma', 0) if ce.get('greeks') else 0
-        ce_iv = ce.get('implied_volatility', 0)
-        
-        pe_oi = pe.get('oi', 0)
-        pe_gamma = pe.get('greeks', {}).get('gamma', 0) if pe.get('greeks') else 0
-        pe_iv = pe.get('implied_volatility', 0)
-        
-        ce_vol, pe_vol = ce.get('volume', 0), pe.get('volume', 0)
-        
-        # --- DYNAMIC OI CHANGE & PREVIOUS OI FALLBACK LOGIC ---
-        api_ce_chg = extract_api_val(ce, ['change_in_oi', 'chng_in_oi', 'oi_change', 'change_oi', 'chg_oi'])
-        api_pe_chg = extract_api_val(pe, ['change_in_oi', 'chng_in_oi', 'oi_change', 'change_oi', 'chg_oi'])
-        
-        ce_prev_oi = extract_api_val(ce, ['previous_oi', 'prev_oi', 'p_oi', 'previous_open_interest']) or 0
-        pe_prev_oi = extract_api_val(pe, ['previous_oi', 'prev_oi', 'p_oi', 'previous_open_interest']) or 0
-        
-        # Call OI Change Calculation
-        if api_ce_chg is not None and api_ce_chg != 0:
-            ce_oi_chg = api_ce_chg
-        elif ce_prev_oi > 0:
-            ce_oi_chg = ce_oi - ce_prev_oi
-        else:
-            if f"CE_{strike}" not in st.session_state.daily_baseline_oi:
-                st.session_state.daily_baseline_oi[f"CE_{strike}"] = ce_oi
-            ce_oi_chg = ce_oi - st.session_state.daily_baseline_oi[f"CE_{strike}"]
-            
-        # Put OI Change Calculation
-        if api_pe_chg is not None and api_pe_chg != 0:
-            pe_oi_chg = api_pe_chg
-        elif pe_prev_oi > 0:
-            pe_oi_chg = pe_oi - pe_prev_oi
-        else:
-            if f"PE_{strike}" not in st.session_state.daily_baseline_oi:
-                st.session_state.daily_baseline_oi[f"PE_{strike}"] = pe_oi
-            pe_oi_chg = pe_oi - st.session_state.daily_baseline_oi[f"PE_{strike}"]
-        # ----------------------------------------
 
-        ce_vol_15m = get_rolling_metric(st.session_state.vol_snapshots, f"CE_{strike}", ce_vol)
-        pe_vol_15m = get_rolling_metric(st.session_state.vol_snapshots, f"PE_{strike}", pe_vol)
-        
+        ce = details.get("ce", {})
+        pe = details.get("pe", {})
+
+        ce_oi = extract_val(ce, ["oi", "open_interest"]) or 0.0
+        pe_oi = extract_val(pe, ["oi", "open_interest"]) or 0.0
+        ce_vol = extract_val(ce, ["volume"]) or 0.0
+        pe_vol = extract_val(pe, ["volume"]) or 0.0
+
+        ce_prev_oi = extract_val(ce, ["previous_oi", "prev_oi", "p_oi"]) or 0.0
+        pe_prev_oi = extract_val(pe, ["previous_oi", "prev_oi", "p_oi"]) or 0.0
+        api_ce_chg = extract_val(ce, ["change_in_oi", "chng_in_oi", "oi_change"])
+        api_pe_chg = extract_val(pe, ["change_in_oi", "chng_in_oi", "oi_change"])
+
+        if api_ce_chg is not None and api_ce_chg != 0:
+            ce_chg = api_ce_chg
+        elif ce_prev_oi > 0:
+            ce_chg = ce_oi - ce_prev_oi
+        else:
+            baseline = st.session_state.daily_baseline_oi.setdefault(f"CE_{strike}", ce_oi)
+            ce_chg = ce_oi - baseline
+
+        if api_pe_chg is not None and api_pe_chg != 0:
+            pe_chg = api_pe_chg
+        elif pe_prev_oi > 0:
+            pe_chg = pe_oi - pe_prev_oi
+        else:
+            baseline = st.session_state.daily_baseline_oi.setdefault(f"PE_{strike}", pe_oi)
+            pe_chg = pe_oi - baseline
+
+        # Add to totals (now strictly constrained to the selected strike range)
         total_ce_oi += ce_oi
         total_pe_oi += pe_oi
-        total_ce_oi_chg += ce_oi_chg
-        total_pe_oi_chg += pe_oi_chg
+        total_ce_oi_chg += ce_chg
+        total_pe_oi_chg += pe_chg
         total_ce_vol += ce_vol
         total_pe_vol += pe_vol
-        total_ce_vol_15m += ce_vol_15m
-        total_pe_vol_15m += pe_vol_15m
-        
-        net_gex = (ce_gamma * ce_oi * LOT_SIZE) - (pe_gamma * pe_oi * LOT_SIZE)
-        
-        total_iv_at_strike = ce_iv + pe_iv
-        if total_iv_at_strike > 0:
-            iv_sum += total_iv_at_strike
-            iv_weighted_strike_sum += (strike * total_iv_at_strike)
-            
-        chain_data.append({
-            'Strike': strike, 
-            'CE_OI_CHG_LAKHS': ce_oi_chg / 100000.0,
-            'PE_OI_CHG_LAKHS': pe_oi_chg / 100000.0,
-            'CE_VOL_LAKHS': ce_vol / 100000.0,
-            'PE_VOL_LAKHS': pe_vol / 100000.0,
-            'CE_VOL_15M_LAKHS': ce_vol_15m / 100000.0,
-            'PE_VOL_15M_LAKHS': pe_vol_15m / 100000.0,
-            'Net_GEX': net_gex
+
+        if strike == atm_strike:
+            atm_ce_iv = extract_val(ce, ["implied_volatility", "iv"]) or 14.0
+            atm_pe_iv = extract_val(pe, ["implied_volatility", "iv"]) or 14.0
+
+        strike_rows.append({
+            "strike": strike,
+            "ce_oi": ce_oi,
+            "pe_oi": pe_oi,
+            "ce_oi_chg": ce_chg,
+            "pe_oi_chg": pe_chg,
+            "ce_vol": ce_vol,
+            "pe_vol": pe_vol,
+            "net_writer_delta": pe_chg - ce_chg
         })
-        
-    df = pd.DataFrame(chain_data)
-    if df.empty: 
-        return None
-        
-    df = df.sort_values('Strike').reset_index(drop=True)
-    
-    call_wall = df.loc[df['Net_GEX'].idxmax()]['Strike']
-    put_wall = df.loc[df['Net_GEX'].idxmin()]['Strike']
-    zero_gamma = df.iloc[(df['Net_GEX'].abs()).argsort()[:1]]['Strike'].values[0]
-    
-    atm_strike = min(df['Strike'], key=lambda x: abs(x - spot_price))
-    atm_ce_iv = option_chain.get(str(atm_strike), {}).get('ce', {}).get('implied_volatility', 0)
-    atm_pe_iv = option_chain.get(str(atm_strike), {}).get('pe', {}).get('implied_volatility', 0)
-    vol_skew = atm_pe_iv - atm_ce_iv 
-    
-    atm_iv_avg = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 15.0
-    daily_1sd = spot_price * (atm_iv_avg / 100) * math.sqrt(1 / 252)
-    iv_vwap = round(iv_weighted_strike_sum / iv_sum, 2) if iv_sum > 0 else spot_price
-    
+
+    # Standard Deviation Calculation
+    atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 14.0
+    daily_1sd = spot_price * (atm_iv / 100) * math.sqrt(1 / 252)
+
+    sd1_upper = round(spot_price + daily_1sd, 2)
+    sd1_lower = round(spot_price - daily_1sd, 2)
+    sd2_upper = round(spot_price + (2 * daily_1sd), 2)
+    sd2_lower = round(spot_price - (2 * daily_1sd), 2)
+
+    # PCRs & Velocities (now derived only from the filtered active zone)
     pcr_oi = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
     pcr_vol = round(total_pe_vol / total_ce_vol, 2) if total_ce_vol > 0 else 1.0
-    
+    pcr_chg = round(total_pe_oi_chg / (total_ce_oi_chg if total_ce_oi_chg != 0 else 1), 2)
+
     total_abs_macro_oi = total_ce_oi + total_pe_oi
     vol_oi_velocity = round((total_ce_vol + total_pe_vol) / (total_abs_macro_oi if total_abs_macro_oi != 0 else 1), 2)
     
-    # Intraday Check Capping
     total_abs_oi_chg = abs(total_ce_oi_chg) + abs(total_pe_oi_chg)
-    if total_abs_oi_chg == 0:
-        pcr_chg = 1.0
-        intra_vol_oi_velocity = 0.0
-    else:
-        pcr_chg = round(total_pe_oi_chg / (total_ce_oi_chg if total_ce_oi_chg != 0 else 1), 2)
-        intra_vol_oi_velocity = round((total_ce_vol + total_pe_vol) / total_abs_oi_chg, 2)
-        
-    # ==========================================
-    # INSTITUTIONAL SMART MONEY TRIGGER LOGIC
-    # ==========================================
-    alert_status = "warning"
-    alert_msg = "⚪ VOLATILITY CONTRACTION: Volume is quiet. Institutions are accumulating. Wait for the breakout trigger."
-    trade_target = "N/A"
-    trade_stop = "N/A"
+    intra_vol_oi_velocity = round((total_ce_vol + total_pe_vol) / (total_abs_oi_chg if total_abs_oi_chg != 0 else 1), 2)
 
-    vol_minimum = 50000 
-    
-    if (total_pe_vol_15m > total_ce_vol_15m * 1.5) and (total_pe_oi_chg > total_ce_oi_chg * 1.2) and (total_pe_vol_15m > vol_minimum):
-        alert_status = "success"
-        alert_msg = "🟢 BULLISH TRIGGER FIRED: Massive Put Writing Divergence Detected. Institutions are aggressively building a floor."
-        trade_target = f"{call_wall} (Call Wall Resistance) or {spot_price + daily_1sd:.1f} (+1 SD)"
-        trade_stop = f"Strict close below {put_wall} (Structural Failure)"
-        
-    elif (total_ce_vol_15m > total_pe_vol_15m * 1.5) and (total_ce_oi_chg > total_pe_oi_chg * 1.2) and (total_ce_vol_15m > vol_minimum):
-        alert_status = "error"
-        alert_msg = "🔴 BEARISH TRIGGER FIRED: Massive Call Writing Divergence Detected. Institutions are aggressively building a ceiling."
-        trade_target = f"{put_wall} (Put Wall Support) or {spot_price - daily_1sd:.1f} (-1 SD)"
-        trade_stop = f"Strict close above {call_wall} (Structural Failure)"
+    now = datetime.now(ist)
+
+    # Append to rolling in-memory buffer
+    st.session_state.writer_history.append({
+        "time": now,
+        "spot": spot_price,
+        "net_writer_lakhs": (total_pe_oi_chg - total_ce_oi_chg) / 100000.0
+    })
+    st.session_state.writer_history = st.session_state.writer_history[-300:]
 
     return {
-        'spot': spot_price, 'zero_gamma': zero_gamma, 'call_wall': call_wall, 'put_wall': put_wall,
-        'vol_skew': vol_skew, 'iv_vwap': iv_vwap, 'sd': daily_1sd,
-        'total_ce_oi': total_ce_oi, 'total_pe_oi': total_pe_oi, 'pcr_oi': pcr_oi,
-        'total_ce_oi_chg': total_ce_oi_chg, 'total_pe_oi_chg': total_pe_oi_chg, 'pcr_chg': pcr_chg,
-        'total_ce_vol': total_ce_vol, 'total_pe_vol': total_pe_vol, 'pcr_vol': pcr_vol,
-        'vol_oi_velocity': vol_oi_velocity,
-        'intra_vol_oi_velocity': intra_vol_oi_velocity,
-        'alert_status': alert_status,
-        'alert_msg': alert_msg,
-        'trade_target': trade_target,
-        'trade_stop': trade_stop,
-        'strike_df': df
+        "timestamp": now,
+        "spot": spot_price,
+        "net_writer_delta": total_pe_oi_chg - total_ce_oi_chg,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "total_ce_oi_chg": total_ce_oi_chg,
+        "total_pe_oi_chg": total_pe_oi_chg,
+        "total_ce_vol": total_ce_vol,
+        "total_pe_vol": total_pe_vol,
+        "pcr_oi": pcr_oi,
+        "pcr_vol": pcr_vol,
+        "pcr_chg": pcr_chg,
+        "vol_oi_velocity": vol_oi_velocity,
+        "intra_vol_oi_velocity": intra_vol_oi_velocity,
+        "sd1_upper": sd1_upper,
+        "sd1_lower": sd1_lower,
+        "sd2_upper": sd2_upper,
+        "sd2_lower": sd2_lower,
+        "strike_df": pd.DataFrame(strike_rows).sort_values("strike")
     }
 
 # ==========================================
-# 4. MARKET HOURS CHECK & STATUS
+# 5. MARKET STATUS & DASHBOARD UI
 # ==========================================
 current_time_ist = datetime.now(ist)
 market_open = current_time_ist.replace(hour=9, minute=15, second=0, microsecond=0)
 market_close = current_time_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-is_weekday = current_time_ist.weekday() < 5
+is_market_open = (current_time_ist.weekday() < 5) and (market_open <= current_time_ist <= market_close)
 
-is_market_open = is_weekday and (market_open <= current_time_ist <= market_close)
+st.title("⚡ Institutional Delta Flow & 1-Minute Logger")
 
-# ==========================================
-# 5. DASHBOARD UI
-# ==========================================
-st.title("📊 Institutional Gamma Command Center")
-
-col_head1, col_head2 = st.columns([8, 2])
-with col_head1:
-    if not is_market_open:
-        st.warning("⏸️ Market is closed. Displaying latest API snapshot.")
+col_h1, col_h2 = st.columns([8, 2])
+with col_h1:
+    if is_market_open:
+        st.success("🟢 Live Dhan Feed Active | Auto-Logging 1-Min Records to PostgreSQL")
     else:
-        st.success("▶️ Live Dhan API Stream Active.")
+        st.warning("⏸️ Market is Closed. Database logging paused.")
 
-with col_head2:
+with col_h2:
     auto_refresh = st.toggle("Auto-Refresh (1 Min)", value=is_market_open)
 
 metrics = process_data()
 
 if metrics:
+    # Auto-log to PostgreSQL every minute
     if is_market_open:
-        log_to_postgres(metrics)
-        
+        log_snapshot_to_db(metrics)
+
     # Update Extrema Tracker
     now_str = datetime.now(ist).strftime("%H:%M")
     tracker = st.session_state.pcr_tracker
     
-    if metrics['pcr_oi'] > tracker['oi_max']['val']:
-        tracker['oi_max'] = {'val': metrics['pcr_oi'], 'time': now_str}
-    if metrics['pcr_oi'] < tracker['oi_min']['val']:
-        tracker['oi_min'] = {'val': metrics['pcr_oi'], 'time': now_str}
+    if metrics['pcr_oi'] > tracker['oi_max']['val']: tracker['oi_max'] = {'val': metrics['pcr_oi'], 'time': now_str}
+    if metrics['pcr_oi'] < tracker['oi_min']['val']: tracker['oi_min'] = {'val': metrics['pcr_oi'], 'time': now_str}
         
-    if metrics['pcr_vol'] > tracker['vol_max']['val']:
-        tracker['vol_max'] = {'val': metrics['pcr_vol'], 'time': now_str}
-    if metrics['pcr_vol'] < tracker['vol_min']['val']:
-        tracker['vol_min'] = {'val': metrics['pcr_vol'], 'time': now_str}
+    if metrics['pcr_vol'] > tracker['vol_max']['val']: tracker['vol_max'] = {'val': metrics['pcr_vol'], 'time': now_str}
+    if metrics['pcr_vol'] < tracker['vol_min']['val']: tracker['vol_min'] = {'val': metrics['pcr_vol'], 'time': now_str}
         
-    if metrics['pcr_chg'] > tracker['chg_max']['val']:
-        tracker['chg_max'] = {'val': metrics['pcr_chg'], 'time': now_str}
-    if metrics['pcr_chg'] < tracker['chg_min']['val']:
-        tracker['chg_min'] = {'val': metrics['pcr_chg'], 'time': now_str}
+    if metrics['pcr_chg'] > tracker['chg_max']['val']: tracker['chg_max'] = {'val': metrics['pcr_chg'], 'time': now_str}
+    if metrics['pcr_chg'] < tracker['chg_min']['val']: tracker['chg_min'] = {'val': metrics['pcr_chg'], 'time': now_str}
         
-    if metrics['vol_oi_velocity'] > tracker['vel_max']['val']:
-        tracker['vel_max'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
-    if metrics['vol_oi_velocity'] < tracker['vel_min']['val']:
-        tracker['vel_min'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
+    if metrics['vol_oi_velocity'] > tracker['vel_max']['val']: tracker['vel_max'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
+    if metrics['vol_oi_velocity'] < tracker['vel_min']['val']: tracker['vel_min'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
         
-    if metrics['intra_vol_oi_velocity'] > tracker['intra_vel_max']['val']:
-        tracker['intra_vel_max'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
-    if metrics['intra_vol_oi_velocity'] < tracker['intra_vel_min']['val']:
-        tracker['intra_vel_min'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
-    
-    # ==========================================
-    # INSTITUTIONAL TRADE ALERT BANNER
-    # ==========================================
-    st.markdown("---")
-    st.markdown("### 🎯 Institutional Execution Engine")
-    
-    if metrics['alert_status'] == "success":
-        st.success(metrics['alert_msg'])
-        colA, colB = st.columns(2)
-        colA.info(f"**🎯 Take Profit Target:** {metrics['trade_target']}")
-        colB.error(f"**🛑 Maximum Risk Stop:** {metrics['trade_stop']}")
-    elif metrics['alert_status'] == "error":
-        st.error(metrics['alert_msg'])
-        colA, colB = st.columns(2)
-        colA.info(f"**🎯 Take Profit Target:** {metrics['trade_target']}")
-        colB.error(f"**🛑 Maximum Risk Stop:** {metrics['trade_stop']}")
+    if metrics['intra_vol_oi_velocity'] > tracker['intra_vel_max']['val']: tracker['intra_vel_max'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
+    if metrics['intra_vol_oi_velocity'] < tracker['intra_vel_min']['val']: tracker['intra_vel_min'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
+
+
+    df_hist = pd.DataFrame(st.session_state.writer_history)
+    df_hist["time"] = pd.to_datetime(df_hist["time"])
+    df_hist["writer_diff_interval"] = df_hist["net_writer_lakhs"].diff(periods=delta_interval).fillna(0.0)
+    df_hist["ema_signal"] = df_hist["writer_diff_interval"].ewm(span=ema_period, adjust=False).mean()
+
+    cur_delta = df_hist["writer_diff_interval"].iloc[-1]
+    cur_ema = df_hist["ema_signal"].iloc[-1]
+
+    # Signal Banner
+    if cur_delta > cur_ema and cur_delta > 0:
+        st.success(f"🟢 **BULLISH FLOW ACTIVE** | {delta_interval}m Put Delta ({cur_delta:+.2f}L) > {ema_period} EMA ({cur_ema:+.2f}L)")
+    elif cur_delta < cur_ema and cur_delta < 0:
+        st.error(f"🔴 **BEARISH FLOW ACTIVE** | {delta_interval}m Call Delta ({cur_delta:+.2f}L) < {ema_period} EMA ({cur_ema:+.2f}L)")
     else:
-        st.warning(metrics['alert_msg'])
-    
+        st.info(f"⚪ **CONSOLIDATION** | Delta ({cur_delta:+.2f}L) is oscillating near {ema_period} EMA ({cur_ema:+.2f}L)")
+
+    # Metrics Overview
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Nifty Spot", f"{metrics['spot']:.2f}")
+    m2.metric(f"{delta_interval}-Min Writer Delta", f"{cur_delta:+.2f}L", delta=round(cur_delta - cur_ema, 2))
+    m3.metric(f"{ema_period} EMA Baseline", f"{cur_ema:+.2f}L")
+    m4.metric("Session Writer Delta", f"{metrics['net_writer_delta']/100000:+.2f}L")
+
+
     st.markdown("---")
+    # ==========================================
+    # BROAD MARKET ORDER FLOW & TRACKERS
+    # ==========================================
+    st.markdown(f"### Broad Market Order Flow (±{strike_depth} Active Zone)")
+    o1, o2, o3, o4, o5 = st.columns(5)
     
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Nifty Spot", f"{metrics['spot']:.2f}", delta=round(metrics['spot'] - metrics['zero_gamma'], 2))
-    col2.metric("Zero Gamma (Regime)", metrics['zero_gamma'])
-    col3.metric("IV VWAP Level", metrics['iv_vwap'])
-    col4.metric("Volatility Skew (PE - CE)", f"{metrics['vol_skew']:.2f}%")
-
-    st.markdown("### Broad Market Order Flow")
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    with m1:
+    with o1:
         st.metric("Total PCR (OI)", metrics['pcr_oi'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Calls: {metrics['total_ce_oi']:,.0f} <br> Puts: {metrics['total_pe_oi']:,.0f}</span>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['oi_max']['val']} ({tracker['oi_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['oi_min']['val']} ({tracker['oi_min']['time']})</span>", unsafe_allow_html=True)
         
-    with m2:
+    with o2:
         st.metric("Intraday PCR (OI Change)", metrics['pcr_chg'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Add: {metrics['total_ce_oi_chg']:,.0f} <br> Put Add: {metrics['total_pe_oi_chg']:,.0f}</span>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['chg_max']['val']} ({tracker['chg_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['chg_min']['val']} ({tracker['chg_min']['time']})</span>", unsafe_allow_html=True)
         
-    with m3:
+    with o3:
         st.metric("Volume PCR", metrics['pcr_vol'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Vol: {metrics['total_ce_vol']:,.0f} <br> Put Vol: {metrics['total_pe_vol']:,.0f}</span>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['vol_max']['val']} ({tracker['vol_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['vol_min']['val']} ({tracker['vol_min']['time']})</span>", unsafe_allow_html=True)
         
-    with m4:
+    with o4:
         st.metric("Macro Vol/OI Velocity", f"{metrics['vol_oi_velocity']}x")
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Overall Market Direction</span><br>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['vel_max']['val']}x ({tracker['vel_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['vel_min']['val']}x ({tracker['vel_min']['time']})</span>", unsafe_allow_html=True)
 
-    with m5:
+    with o5:
         st.metric("Intraday Vol/OI Velocity", f"{metrics['intra_vol_oi_velocity']}x")
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Pure Intraday Intensity</span><br>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['intra_vel_max']['val']}x ({tracker['intra_vel_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['intra_vel_min']['val']}x ({tracker['intra_vel_min']['time']})</span>", unsafe_allow_html=True)
 
 
     st.markdown("---")
-    
-    today_str = datetime.now().strftime("%a, %d %b")
-    df = metrics['strike_df']
-    spot_val = metrics['spot']
-    
-    def render_bar_chart(title, df_col_pe, df_col_ce, y_title):
+    st.markdown("### Statistical Boundaries")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.success(f"**-2.0 SD:** {metrics['sd2_lower']}")
+    s2.success(f"**-1.0 SD:** {metrics['sd1_lower']}")
+    s3.warning(f"**+1.0 SD:** {metrics['sd1_upper']}")
+    s4.warning(f"**+2.0 SD:** {metrics['sd2_upper']}")
+
+    # ==========================================
+    # CHART RENDERING HELPERS
+    # ==========================================
+    df_strikes = metrics["strike_df"]
+    spot_val = metrics["spot"]
+    today_str = datetime.now(ist).strftime("%a, %d %b")
+
+    def render_grouped_bar_chart(title, y_col_pe, y_col_ce, y_label):
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=df['Strike'], y=df[df_col_pe], name=f'Put {y_title}', marker_color='#4CAF50',
-            hovertemplate=f'Strike: %{{x}}<br>Put {y_title}: %{{y:.2f}}L<extra></extra>'
+            x=df_strikes['strike'], y=df_strikes[y_col_pe] / 100000.0, name=f'Put {y_label}', marker_color='#4CAF50',
+            hovertemplate=f'Strike: %{{x}}<br>Put {y_label}: %{{y:.2f}}L<extra></extra>'
         ))
         fig.add_trace(go.Bar(
-            x=df['Strike'], y=df[df_col_ce], name=f'Call {y_title}', marker_color='#F44336',
-            hovertemplate=f'Strike: %{{x}}<br>Call {y_title}: %{{y:.2f}}L<extra></extra>'
+            x=df_strikes['strike'], y=df_strikes[y_col_ce] / 100000.0, name=f'Call {y_label}', marker_color='#F44336',
+            hovertemplate=f'Strike: %{{x}}<br>Call {y_label}: %{{y:.2f}}L<extra></extra>'
         ))
         fig.add_vline(
             x=spot_val, line_width=2, line_dash="dash", line_color="#424242",
@@ -457,51 +512,72 @@ if metrics:
         )
         fig.update_layout(
             barmode='group', height=400, template="plotly_white", margin=dict(l=40, r=40, t=40, b=40),
-            xaxis=dict(title="Strike", tickmode='array', tickvals=df['Strike'], tickangle=-45, showgrid=True, gridcolor='#f0f0f0'),
-            yaxis=dict(title=f"Call / Put {y_title}", ticksuffix="L", showgrid=True, gridcolor='#f0f0f0'),
+            xaxis=dict(title="Strike", tickmode='array', tickvals=df_strikes['strike'], tickangle=-45, showgrid=True, gridcolor='#f0f0f0'),
+            yaxis=dict(title=f"{y_label} (Lakhs)", ticksuffix="L", showgrid=True, gridcolor='#f0f0f0'),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             hovermode="x unified"
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    # ==========================================
-    # CHART RENDERING
-    # ==========================================
-    st.markdown(f"### OI Change on {today_str}")
-    render_bar_chart(f"OI Change on {today_str}", 'PE_OI_CHG_LAKHS', 'CE_OI_CHG_LAKHS', 'OI Change')
 
-    st.markdown(f"### Total Volume on {today_str}")
-    render_bar_chart(f"Total Volume on {today_str}", 'PE_VOL_LAKHS', 'CE_VOL_LAKHS', 'Volume')
-
-    st.markdown(f"### Active Pace: 15-Min Rolling Volume")
-    if is_market_open:
-        st.caption("Tracks immediate institutional volume flow generated in the last 15 minutes.")
-        render_bar_chart("Active 15-Min Volume", 'PE_VOL_15M_LAKHS', 'CE_VOL_15M_LAKHS', '15m Vol')
-    else:
-        st.info("Market is closed. 15-Min Rolling Volume tracking requires live data updates.")
-
+    # Main Chart: Writer Delta vs EMA
     st.markdown("---")
-    
-    # ==========================================
-    # STRUCTURAL BOUNDARIES
-    # ==========================================
-    st.markdown("### Structural Boundaries")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.info(f"**Call Wall (Resistance):** {metrics['call_wall']}")
-        st.info(f"**Put Wall (Support):** {metrics['put_wall']}")
-    with c2:
-        st.warning(f"**+2.0 SD:** {metrics['spot'] + (2.0 * metrics['sd']):.1f}")
-        st.warning(f"**+1.0 SD:** {metrics['spot'] + (1.0 * metrics['sd']):.1f}")
-    with c3:
-        st.success(f"**-1.0 SD:** {metrics['spot'] - (1.0 * metrics['sd']):.1f}")
-        st.success(f"**-2.0 SD:** {metrics['spot'] - (2.0 * metrics['sd']):.1f}")
+    st.markdown(f"### 📈 Net Writer Delta ({delta_interval}-Min) vs. {ema_period} EMA")
+    fig_delta = go.Figure()
+    colors = ["#4CAF50" if val >= 0 else "#F44336" for val in df_hist["writer_diff_interval"]]
+    fig_delta.add_trace(go.Bar(
+        x=df_hist["time"], y=df_hist["writer_diff_interval"],
+        name=f"{delta_interval}m Delta", marker_color=colors
+    ))
+    fig_delta.add_trace(go.Scatter(
+        x=df_hist["time"], y=df_hist["ema_signal"],
+        name=f"{ema_period} EMA", line=dict(color="#FFD700", width=2.5)
+    ))
+    fig_delta.update_layout(
+        height=420, template="plotly_white", margin=dict(l=40, r=40, t=20, b=30),
+        xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
+        yaxis=dict(title=f"Net Delta ({delta_interval}m) [L]", showgrid=True, gridcolor="#f0f0f0"),
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_delta, use_container_width=True)
 
-else:
-    st.error("⚠️ **No Data Received from Dhan API.** Verify your Client ID, Access Token, and Expiry Date.")
+    # Strike-Wise Net Writing Distribution Chart
+    st.markdown("---")
+    st.markdown(f"### 📌 Current Strike-Wise Writer Dominance (±{strike_depth} Points)")
+    fig_strike = go.Figure()
+    bar_colors = ["#4CAF50" if x >= 0 else "#F44336" for x in df_strikes["net_writer_delta"]]
+
+    fig_strike.add_trace(go.Bar(
+        x=df_strikes["strike"],
+        y=df_strikes["net_writer_delta"] / 100000.0,
+        marker_color=bar_colors,
+        name="Net Put - Call Add",
+        hovertemplate="Strike: %{x}<br>Net Delta: %{y:.2f}L<extra></extra>"
+    ))
+
+    fig_strike.add_vline(
+        x=spot_val, line_width=2, line_dash="dash", line_color="#424242",
+        annotation_text=f"NIFTY {spot_val:.2f}", annotation_position="top"
+    )
+
+    fig_strike.update_layout(
+        height=380, template="plotly_white", margin=dict(l=40, r=40, t=20, b=30),
+        xaxis=dict(title="Strike", tickmode="array", tickvals=df_strikes["strike"], tickangle=-45, showgrid=True, gridcolor="#f0f0f0"),
+        yaxis=dict(title="Net Writer Delta (Lakhs)", showgrid=True, gridcolor="#f0f0f0", zeroline=True, zerolinecolor="#000000"),
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_strike, use_container_width=True)
+
+    # Restored Bar Charts for OI Change & Volume
+    st.markdown("---")
+    st.markdown(f"### 📊 OI Change on {today_str}")
+    render_grouped_bar_chart(f"OI Change on {today_str}", 'pe_oi_chg', 'ce_oi_chg', 'OI Change')
+
+    st.markdown(f"### 📊 Total Volume on {today_str}")
+    render_grouped_bar_chart(f"Total Volume on {today_str}", 'pe_vol', 'ce_vol', 'Volume')
 
 # ==========================================
-# 6. CONDITIONAL AUTO-REFRESH
+# 6. REFRESH LOOP
 # ==========================================
 if auto_refresh and is_market_open:
     time.sleep(60)
