@@ -1,0 +1,13 @@
+[Unit]
+Description=Gamma Trading Dashboard Service
+After=network.target postgresql.service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/gamma_app
+ExecStart=/usr/local/bin/streamlit run GammaDashboard.py --server.port 8501 --server.address 0.0.0.0
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
