@@ -91,8 +91,12 @@ def log_snapshot_to_db(m):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         strike_json = m["strike_df"].to_dict(orient="records")
+        
+        # Strip timezone info so it writes pure IST into TIMESTAMP WITHOUT TIME ZONE
+        ist_naive_timestamp = m["timestamp"].replace(tzinfo=None)
+
         values = (
-            m["timestamp"], m["spot"], m["net_writer_delta"], m["total_ce_oi"], m["total_pe_oi"],
+            ist_naive_timestamp, m["spot"], m["net_writer_delta"], m["total_ce_oi"], m["total_pe_oi"],
             m["total_ce_oi_chg"], m["total_pe_oi_chg"], m["total_ce_vol"], m["total_pe_vol"],
             m["pcr_oi"], m["pcr_vol"], m["pcr_chg"], m["vol_oi_velocity"], m["intra_vol_oi_velocity"],
             m["sd1_upper"], m["sd1_lower"], m["sd2_upper"], m["sd2_lower"], Json(strike_json)
