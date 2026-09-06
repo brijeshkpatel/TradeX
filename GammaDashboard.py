@@ -147,10 +147,12 @@ def flush_database():
 ist = pytz.timezone("Asia/Kolkata")
 current_date = datetime.now(ist).date()
 
-if "writer_history" not in st.session_state:
-    st.session_state.writer_history = []
 if "daily_baseline_oi" not in st.session_state:
     st.session_state.daily_baseline_oi = {}
+
+# Time-series buffer for PCR charting
+if "pcr_history" not in st.session_state:
+    st.session_state.pcr_history = []
 
 # Daily Extrema Tracker
 if 'pcr_tracker' not in st.session_state or st.session_state.pcr_tracker.get('date') != current_date:
@@ -169,20 +171,6 @@ if 'pcr_tracker' not in st.session_state or st.session_state.pcr_tracker.get('da
     }
 
 st.sidebar.title("⚙️ Strategy Parameters")
-
-delta_interval = st.sidebar.select_slider(
-    "⏱️ Delta Interval (Minutes)",
-    options=[1, 2, 3, 5, 10, 15, 30],
-    value=5
-)
-
-ema_period = st.sidebar.number_input(
-    "📈 EMA Smoothing Period",
-    min_value=2,
-    max_value=100,
-    value=9,
-    step=1
-)
 
 strike_depth = st.sidebar.slider(
     "🎯 Strike Range (± Points)",
@@ -337,7 +325,7 @@ def process_data():
     sd2_upper = round(spot_price + (2 * daily_1sd), 2)
     sd2_lower = round(spot_price - (2 * daily_1sd), 2)
 
-    # PCRs & Velocities (now derived only from the filtered active zone)
+    # PCRs & Velocities (derived from the active zone)
     pcr_oi = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
     pcr_vol = round(total_pe_vol / total_ce_vol, 2) if total_ce_vol > 0 else 1.0
     pcr_chg = round(total_pe_oi_chg / (total_ce_oi_chg if total_ce_oi_chg != 0 else 1), 2)
@@ -350,13 +338,15 @@ def process_data():
 
     now = datetime.now(ist)
 
-    # Append to rolling in-memory buffer
-    st.session_state.writer_history.append({
+    # Append to rolling in-memory buffer for real-time PCR line plots
+    st.session_state.pcr_history.append({
         "time": now,
-        "spot": spot_price,
-        "net_writer_lakhs": (total_pe_oi_chg - total_ce_oi_chg) / 100000.0
+        "pcr_oi": pcr_oi,
+        "pcr_chg": pcr_chg,
+        "pcr_vol": pcr_vol,
+        "spot": spot_price
     })
-    st.session_state.writer_history = st.session_state.writer_history[-300:]
+    st.session_state.pcr_history = st.session_state.pcr_history[-375:]  # Keep full trading day
 
     return {
         "timestamp": now,
@@ -426,30 +416,10 @@ if metrics:
     if metrics['intra_vol_oi_velocity'] > tracker['intra_vel_max']['val']: tracker['intra_vel_max'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
     if metrics['intra_vol_oi_velocity'] < tracker['intra_vel_min']['val']: tracker['intra_vel_min'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
 
-
-    df_hist = pd.DataFrame(st.session_state.writer_history)
-    df_hist["time"] = pd.to_datetime(df_hist["time"])
-    df_hist["writer_diff_interval"] = df_hist["net_writer_lakhs"].diff(periods=delta_interval).fillna(0.0)
-    df_hist["ema_signal"] = df_hist["writer_diff_interval"].ewm(span=ema_period, adjust=False).mean()
-
-    cur_delta = df_hist["writer_diff_interval"].iloc[-1]
-    cur_ema = df_hist["ema_signal"].iloc[-1]
-
-    # Signal Banner
-    if cur_delta > cur_ema and cur_delta > 0:
-        st.success(f"🟢 **BULLISH FLOW ACTIVE** | {delta_interval}m Put Delta ({cur_delta:+.2f}L) > {ema_period} EMA ({cur_ema:+.2f}L)")
-    elif cur_delta < cur_ema and cur_delta < 0:
-        st.error(f"🔴 **BEARISH FLOW ACTIVE** | {delta_interval}m Call Delta ({cur_delta:+.2f}L) < {ema_period} EMA ({cur_ema:+.2f}L)")
-    else:
-        st.info(f"⚪ **CONSOLIDATION** | Delta ({cur_delta:+.2f}L) is oscillating near {ema_period} EMA ({cur_ema:+.2f}L)")
-
     # Metrics Overview
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2 = st.columns(2)
     m1.metric("Nifty Spot", f"{metrics['spot']:.2f}")
-    m2.metric(f"{delta_interval}-Min Writer Delta", f"{cur_delta:+.2f}L", delta=round(cur_delta - cur_ema, 2))
-    m3.metric(f"{ema_period} EMA Baseline", f"{cur_ema:+.2f}L")
-    m4.metric("Session Writer Delta", f"{metrics['net_writer_delta']/100000:+.2f}L")
-
+    m2.metric("Session Writer Delta", f"{metrics['net_writer_delta']/100000:+.2f}L")
 
     st.markdown("---")
     # ==========================================
@@ -483,7 +453,6 @@ if metrics:
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Pure Intraday Intensity</span><br>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['intra_vel_max']['val']}x ({tracker['intra_vel_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['intra_vel_min']['val']}x ({tracker['intra_vel_min']['time']})</span>", unsafe_allow_html=True)
 
-
     st.markdown("---")
     st.markdown("### Statistical Boundaries")
     s1, s2, s3, s4 = st.columns(4)
@@ -491,6 +460,71 @@ if metrics:
     s2.success(f"**-1.0 SD:** {metrics['sd1_lower']}")
     s3.warning(f"**+1.0 SD:** {metrics['sd1_upper']}")
     s4.warning(f"**+2.0 SD:** {metrics['sd2_upper']}")
+
+    # ==========================================
+    # PCR TRENDS OVER TIME (NEW CHARTS)
+    # ==========================================
+    st.markdown("---")
+    st.markdown("### 📈 PCR Trends Over Time")
+
+    df_pcr = pd.DataFrame(st.session_state.pcr_history)
+    
+    if not df_pcr.empty:
+        col_pcr1, col_pcr2 = st.columns(2)
+
+        # 1. Total PCR (OI) Chart
+        with col_pcr1:
+            fig_pcr_oi = go.Figure()
+            fig_pcr_oi.add_trace(go.Scatter(
+                x=df_pcr["time"],
+                y=df_pcr["pcr_oi"],
+                mode="lines+markers",
+                name="Total PCR (OI)",
+                line=dict(color="#2196F3", width=2.5),
+                marker=dict(size=4),
+                hovertemplate="Time: %{x|%H:%M}<br>Total PCR: %{y:.2f}<extra></extra>"
+            ))
+            fig_pcr_oi.add_hline(
+                y=1.0, line_dash="dash", line_color="#757575",
+                annotation_text="Neutral (1.0)", annotation_position="bottom right"
+            )
+            fig_pcr_oi.update_layout(
+                title="Total PCR (OI Macro)",
+                height=340,
+                template="plotly_white",
+                margin=dict(l=40, r=40, t=40, b=30),
+                xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
+                yaxis=dict(title="PCR (OI)", showgrid=True, gridcolor="#f0f0f0"),
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_pcr_oi, use_container_width=True)
+
+        # 2. Intraday PCR (OI Change) Chart
+        with col_pcr2:
+            fig_pcr_chg = go.Figure()
+            fig_pcr_chg.add_trace(go.Scatter(
+                x=df_pcr["time"],
+                y=df_pcr["pcr_chg"],
+                mode="lines+markers",
+                name="Intraday PCR (Chg)",
+                line=dict(color="#FF9800", width=2.5),
+                marker=dict(size=4),
+                hovertemplate="Time: %{x|%H:%M}<br>Intraday PCR: %{y:.2f}<extra></extra>"
+            ))
+            fig_pcr_chg.add_hline(
+                y=1.0, line_dash="dash", line_color="#757575",
+                annotation_text="Neutral (1.0)", annotation_position="bottom right"
+            )
+            fig_pcr_chg.update_layout(
+                title="Intraday PCR (OI Change Flow)",
+                height=340,
+                template="plotly_white",
+                margin=dict(l=40, r=40, t=40, b=30),
+                xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
+                yaxis=dict(title="PCR (OI Change)", showgrid=True, gridcolor="#f0f0f0"),
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_pcr_chg, use_container_width=True)
 
     # ==========================================
     # CHART RENDERING HELPERS
@@ -522,28 +556,6 @@ if metrics:
             hovermode="x unified"
         )
         st.plotly_chart(fig, use_container_width=True)
-
-
-    # Main Chart: Writer Delta vs EMA
-    st.markdown("---")
-    st.markdown(f"### 📈 Net Writer Delta ({delta_interval}-Min) vs. {ema_period} EMA")
-    fig_delta = go.Figure()
-    colors = ["#4CAF50" if val >= 0 else "#F44336" for val in df_hist["writer_diff_interval"]]
-    fig_delta.add_trace(go.Bar(
-        x=df_hist["time"], y=df_hist["writer_diff_interval"],
-        name=f"{delta_interval}m Delta", marker_color=colors
-    ))
-    fig_delta.add_trace(go.Scatter(
-        x=df_hist["time"], y=df_hist["ema_signal"],
-        name=f"{ema_period} EMA", line=dict(color="#FFD700", width=2.5)
-    ))
-    fig_delta.update_layout(
-        height=420, template="plotly_white", margin=dict(l=40, r=40, t=20, b=30),
-        xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(title=f"Net Delta ({delta_interval}m) [L]", showgrid=True, gridcolor="#f0f0f0"),
-        hovermode="x unified"
-    )
-    st.plotly_chart(fig_delta, use_container_width=True)
 
     # Strike-Wise Net Writing Distribution Chart
     st.markdown("---")
