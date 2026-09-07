@@ -461,71 +461,112 @@ if metrics:
     s3.warning(f"**+1.0 SD:** {metrics['sd1_upper']}")
     s4.warning(f"**+2.0 SD:** {metrics['sd2_upper']}")
 
-    # ==========================================
-    # PCR TRENDS OVER TIME (NEW CHARTS)
+   # ==========================================
+    # PCR TRENDS OVER TIME (POLISHED SENTIMENT CHARTS)
     # ==========================================
     st.markdown("---")
-    st.markdown("### 📈 PCR Trends Over Time")
+    st.markdown("### 📈 PCR Sentiment & Flow Trends")
 
     df_pcr = pd.DataFrame(st.session_state.pcr_history)
     
     if not df_pcr.empty:
+        # Create a display copy to clean and bound values for visual clarity
+        df_plot = df_pcr.copy()
+        
+        # Clip Intraday PCR display to avoid erratic zero-division spikes (-0.5 to 3.0)
+        df_plot["pcr_chg_clamped"] = df_plot["pcr_chg"].clip(lower=-0.5, upper=3.0)
+
         col_pcr1, col_pcr2 = st.columns(2)
 
-        # 1. Total PCR (OI) Chart
+        # 1. TOTAL PCR (OI MACRO)
         with col_pcr1:
             fig_pcr_oi = go.Figure()
-            fig_pcr_oi.add_trace(go.Scatter(
-                x=df_pcr["time"],
-                y=df_pcr["pcr_oi"],
-                mode="lines+markers",
-                name="Total PCR (OI)",
-                line=dict(color="#2196F3", width=2.5),
-                marker=dict(size=4),
-                hovertemplate="Time: %{x|%H:%M}<br>Total PCR: %{y:.2f}<extra></extra>"
-            ))
-            fig_pcr_oi.add_hline(
-                y=1.0, line_dash="dash", line_color="#757575",
-                annotation_text="Neutral (1.0)", annotation_position="bottom right"
+
+            # Green Bullish Area Fill (> 1.0)
+            fig_pcr_oi.add_hrect(
+                y0=1.0, y1=2.5, fillcolor="rgba(76, 175, 80, 0.08)",
+                layer="below", line_width=0, annotation_text="BULLISH SUPPORT (>1.0)",
+                annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
             )
+            # Red Bearish Area Fill (< 1.0)
+            fig_pcr_oi.add_hrect(
+                y0=0.0, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
+                layer="below", line_width=0, annotation_text="BEARISH RESISTANCE (<1.0)",
+                annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
+            )
+
+            # Trend line
+            fig_pcr_oi.add_trace(go.Scatter(
+                x=df_plot["time"],
+                y=df_plot["pcr_oi"],
+                mode="lines+markers",
+                name="Total PCR",
+                line=dict(color="#00E5FF", width=2.5),
+                marker=dict(size=5, color="#FFFFFF", line=dict(color="#00E5FF", width=1.5)),
+                hovertemplate="Time: %{x|%H:%M}<br>Total PCR: <b>%{y:.2f}</b><extra></extra>"
+            ))
+
+            # Neutral Level
+            fig_pcr_oi.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
+
             fig_pcr_oi.update_layout(
-                title="Total PCR (OI Macro)",
-                height=340,
-                template="plotly_white",
-                margin=dict(l=40, r=40, t=40, b=30),
-                xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
-                yaxis=dict(title="PCR (OI)", showgrid=True, gridcolor="#f0f0f0"),
+                title=dict(text="<b>Macro PCR (Total OI)</b>", font=dict(size=15, color="#FFFFFF")),
+                height=360,
+                template="plotly_dark",
+                paper_bgcolor="rgba(15, 23, 42, 0.6)",
+                plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                margin=dict(l=40, r=40, t=50, b=30),
+                xaxis=dict(title="Time (IST)", tickformat="%H:%M", showgrid=True, gridcolor="#263238"),
+                yaxis=dict(title="PCR (OI)", range=[0.4, 2.0], showgrid=True, gridcolor="#263238"),
                 hovermode="x unified"
             )
             st.plotly_chart(fig_pcr_oi, use_container_width=True)
 
-        # 2. Intraday PCR (OI Change) Chart
+        # 2. INTRADAY PCR (OI CHANGE FLOW)
         with col_pcr2:
             fig_pcr_chg = go.Figure()
-            fig_pcr_chg.add_trace(go.Scatter(
-                x=df_pcr["time"],
-                y=df_pcr["pcr_chg"],
-                mode="lines+markers",
-                name="Intraday PCR (Chg)",
-                line=dict(color="#FF9800", width=2.5),
-                marker=dict(size=4),
-                hovertemplate="Time: %{x|%H:%M}<br>Intraday PCR: %{y:.2f}<extra></extra>"
-            ))
-            fig_pcr_chg.add_hline(
-                y=1.0, line_dash="dash", line_color="#757575",
-                annotation_text="Neutral (1.0)", annotation_position="bottom right"
+
+            # Green Bullish Area Fill (> 1.0)
+            fig_pcr_chg.add_hrect(
+                y0=1.0, y1=3.0, fillcolor="rgba(76, 175, 80, 0.08)",
+                layer="below", line_width=0, annotation_text="AGGRESSIVE PUT WRITING (>1.0)",
+                annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
             )
+            # Red Bearish Area Fill (< 1.0)
+            fig_pcr_chg.add_hrect(
+                y0=-0.5, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
+                layer="below", line_width=0, annotation_text="AGGRESSIVE CALL WRITING (<1.0)",
+                annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
+            )
+
+            # Trend line
+            fig_pcr_chg.add_trace(go.Scatter(
+                x=df_plot["time"],
+                y=df_plot["pcr_chg_clamped"],
+                mode="lines+markers",
+                name="Intraday PCR",
+                line=dict(color="#FFB300", width=2.5),
+                marker=dict(size=5, color="#FFFFFF", line=dict(color="#FFB300", width=1.5)),
+                hovertemplate="Time: %{x|%H:%M}<br>Intraday PCR: <b>%{y:.2f}</b><extra></extra>"
+            ))
+
+            # Neutral Level
+            fig_pcr_chg.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
+            # Zero baseline to distinguish unwinding from simple bias
+            fig_pcr_chg.add_hline(y=0.0, line_dash="dot", line_color="#78909C", line_width=1)
+
             fig_pcr_chg.update_layout(
-                title="Intraday PCR (OI Change Flow)",
-                height=340,
-                template="plotly_white",
-                margin=dict(l=40, r=40, t=40, b=30),
-                xaxis=dict(title="Time", showgrid=True, gridcolor="#f0f0f0"),
-                yaxis=dict(title="PCR (OI Change)", showgrid=True, gridcolor="#f0f0f0"),
+                title=dict(text="<b>Intraday Flow PCR (OI Change)</b>", font=dict(size=15, color="#FFFFFF")),
+                height=360,
+                template="plotly_dark",
+                paper_bgcolor="rgba(15, 23, 42, 0.6)",
+                plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                margin=dict(l=40, r=40, t=50, b=30),
+                xaxis=dict(title="Time (IST)", tickformat="%H:%M", showgrid=True, gridcolor="#263238"),
+                yaxis=dict(title="PCR (OI Change)", range=[-0.2, 2.5], showgrid=True, gridcolor="#263238"),
                 hovermode="x unified"
             )
             st.plotly_chart(fig_pcr_chg, use_container_width=True)
-
     # ==========================================
     # CHART RENDERING HELPERS
     # ==========================================
