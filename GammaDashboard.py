@@ -16,7 +16,6 @@ import plotly.graph_objects as go
 # ==========================================
 st.set_page_config(page_title="Institutional Gamma Command Center", layout="wide")
 
-# Read from Streamlit Secrets with fallback to defaults
 CLIENT_ID = st.secrets.get("DHAN_CLIENT_ID", "DHAN_CLIENT_ID")
 ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "DHAN_ACCESS_TOKEN")
 EXPIRY_DATE = st.secrets.get("EXPIRY_DATE", "EXPIRY_DATE")
@@ -31,9 +30,10 @@ DB_CONFIG = {
     "password": st.secrets.get("DB_PASSWORD", "DB_PASSWORD"),
     "host": st.secrets.get("DB_HOST", "DB_HOST"),
     "port": st.secrets.get("DB_PORT", "5432"),
-    "sslmode": "require" # Required for Cloud DBs like Neon/Supabase
+    "sslmode": st.secrets.get("DB_SSLMODE", "require")
 }
 
+ist = pytz.timezone("Asia/Kolkata")
 
 # ==========================================
 # 2. DATABASE MANAGEMENT & INITIALIZATION
@@ -91,8 +91,6 @@ def log_snapshot_to_db(m):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         strike_json = m["strike_df"].to_dict(orient="records")
-        
-        # Strip timezone info so it writes pure IST into TIMESTAMP WITHOUT TIME ZONE
         ist_naive_timestamp = m["timestamp"].replace(tzinfo=None)
 
         values = (
@@ -120,6 +118,24 @@ def get_db_row_count():
     except Exception:
         return 0
 
+def fetch_today_records():
+    """Fetches all snapshot rows recorded today, converted to Asia/Kolkata timezone."""
+    try:
+        conn = get_db_connection()
+        query = """
+            SELECT * FROM market_snapshots_1m 
+            WHERE timestamp::date = CURRENT_DATE 
+            ORDER BY timestamp ASC;
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert('Asia/Kolkata')
+        return df
+    except Exception as e:
+        st.sidebar.error(f"DB Read Error: {e}")
+        return pd.DataFrame()
+
 def fetch_all_db_records():
     try:
         conn = get_db_connection()
@@ -142,34 +158,8 @@ def flush_database():
         return False
 
 # ==========================================
-# 3. SESSION STATE & SIDEBAR PARAMETERS
+# 3. SIDEBAR PARAMETERS & DATABASE UTILITY
 # ==========================================
-ist = pytz.timezone("Asia/Kolkata")
-current_date = datetime.now(ist).date()
-
-if "daily_baseline_oi" not in st.session_state:
-    st.session_state.daily_baseline_oi = {}
-
-# Time-series buffer for PCR charting
-if "pcr_history" not in st.session_state:
-    st.session_state.pcr_history = []
-
-# Daily Extrema Tracker
-if 'pcr_tracker' not in st.session_state or st.session_state.pcr_tracker.get('date') != current_date:
-    st.session_state.pcr_tracker = {
-        'date': current_date,
-        'oi_max': {'val': 0.0, 'time': '--:--'},
-        'oi_min': {'val': 999.0, 'time': '--:--'},
-        'vol_max': {'val': 0.0, 'time': '--:--'},
-        'vol_min': {'val': 999.0, 'time': '--:--'},
-        'chg_max': {'val': 0.0, 'time': '--:--'},
-        'chg_min': {'val': 999.0, 'time': '--:--'},
-        'vel_max': {'val': 0.0, 'time': '--:--'},
-        'vel_min': {'val': 9999.0, 'time': '--:--'},
-        'intra_vel_max': {'val': 0.0, 'time': '--:--'},
-        'intra_vel_min': {'val': 9999.0, 'time': '--:--'}
-    }
-
 st.sidebar.title("⚙️ Strategy Parameters")
 
 strike_depth = st.sidebar.slider(
@@ -178,10 +168,9 @@ strike_depth = st.sidebar.slider(
     max_value=1000,
     value=400,
     step=50,
-    help="Restricts ALL calculations (PCRs, Velocities, Net Delta) to this specific zone."
+    help="Restricts ALL calculations to this specific zone."
 )
 
-# Database Management in Sidebar
 st.sidebar.markdown("---")
 st.sidebar.title("💾 Expiry Data Management")
 db_count = get_db_row_count()
@@ -213,6 +202,9 @@ if st.sidebar.button("Flush Server DB", disabled=not confirm_flush):
 # ==========================================
 # 4. DATA ENGINE (DHAN API FETCH)
 # ==========================================
+if "daily_baseline_oi" not in st.session_state:
+    st.session_state.daily_baseline_oi = {}
+
 def fetch_option_chain():
     url = "https://api.dhan.co/v2/optionchain"
     headers = {
@@ -259,8 +251,6 @@ def process_data():
 
     for strike_str, details in option_chain.items():
         strike = float(strike_str)
-        
-        # 🎯 STRICT FILTER: Only calculate metrics for strikes within the selected range
         if not (spot_price - strike_depth <= strike <= spot_price + strike_depth):
             continue
 
@@ -293,7 +283,6 @@ def process_data():
             baseline = st.session_state.daily_baseline_oi.setdefault(f"PE_{strike}", pe_oi)
             pe_chg = pe_oi - baseline
 
-        # Add to totals (now strictly constrained to the selected strike range)
         total_ce_oi += ce_oi
         total_pe_oi += pe_oi
         total_ce_oi_chg += ce_chg
@@ -316,7 +305,6 @@ def process_data():
             "net_writer_delta": pe_chg - ce_chg
         })
 
-    # Standard Deviation Calculation
     atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 14.0
     daily_1sd = spot_price * (atm_iv / 100) * math.sqrt(1 / 252)
 
@@ -325,7 +313,6 @@ def process_data():
     sd2_upper = round(spot_price + (2 * daily_1sd), 2)
     sd2_lower = round(spot_price - (2 * daily_1sd), 2)
 
-    # PCRs & Velocities (derived from the active zone)
     pcr_oi = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
     pcr_vol = round(total_pe_vol / total_ce_vol, 2) if total_ce_vol > 0 else 1.0
     pcr_chg = round(total_pe_oi_chg / (total_ce_oi_chg if total_ce_oi_chg != 0 else 1), 2)
@@ -337,16 +324,6 @@ def process_data():
     intra_vol_oi_velocity = round((total_ce_vol + total_pe_vol) / (total_abs_oi_chg if total_abs_oi_chg != 0 else 1), 2)
 
     now = datetime.now(ist)
-
-    # Append to rolling in-memory buffer for real-time PCR line plots
-    st.session_state.pcr_history.append({
-        "time": now,
-        "pcr_oi": pcr_oi,
-        "pcr_chg": pcr_chg,
-        "pcr_vol": pcr_vol,
-        "spot": spot_price
-    })
-    st.session_state.pcr_history = st.session_state.pcr_history[-375:]  # Keep full trading day
 
     return {
         "timestamp": now,
@@ -393,28 +370,38 @@ with col_h2:
 metrics = process_data()
 
 if metrics:
-    # Auto-log to PostgreSQL every minute
     if is_market_open:
         log_snapshot_to_db(metrics)
 
-    # Update Extrema Tracker
-    now_str = datetime.now(ist).strftime("%H:%M")
-    tracker = st.session_state.pcr_tracker
-    
-    if metrics['pcr_oi'] > tracker['oi_max']['val']: tracker['oi_max'] = {'val': metrics['pcr_oi'], 'time': now_str}
-    if metrics['pcr_oi'] < tracker['oi_min']['val']: tracker['oi_min'] = {'val': metrics['pcr_oi'], 'time': now_str}
-        
-    if metrics['pcr_vol'] > tracker['vol_max']['val']: tracker['vol_max'] = {'val': metrics['pcr_vol'], 'time': now_str}
-    if metrics['pcr_vol'] < tracker['vol_min']['val']: tracker['vol_min'] = {'val': metrics['pcr_vol'], 'time': now_str}
-        
-    if metrics['pcr_chg'] > tracker['chg_max']['val']: tracker['chg_max'] = {'val': metrics['pcr_chg'], 'time': now_str}
-    if metrics['pcr_chg'] < tracker['chg_min']['val']: tracker['chg_min'] = {'val': metrics['pcr_chg'], 'time': now_str}
-        
-    if metrics['vol_oi_velocity'] > tracker['vel_max']['val']: tracker['vel_max'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
-    if metrics['vol_oi_velocity'] < tracker['vel_min']['val']: tracker['vel_min'] = {'val': metrics['vol_oi_velocity'], 'time': now_str}
-        
-    if metrics['intra_vol_oi_velocity'] > tracker['intra_vel_max']['val']: tracker['intra_vel_max'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
-    if metrics['intra_vol_oi_velocity'] < tracker['intra_vel_min']['val']: tracker['intra_vel_min'] = {'val': metrics['intra_vol_oi_velocity'], 'time': now_str}
+# Fetch chronological data straight from DB for today's session
+df_history = fetch_today_records()
+
+if metrics:
+    # Compute high/low extrema dynamically from DB records
+    if not df_history.empty:
+        oi_max_row = df_history.loc[df_history['pcr_oi'].idxmax()]
+        oi_min_row = df_history.loc[df_history['pcr_oi'].idxmin()]
+        chg_max_row = df_history.loc[df_history['pcr_chg'].idxmax()]
+        chg_min_row = df_history.loc[df_history['pcr_chg'].idxmin()]
+        vol_max_row = df_history.loc[df_history['pcr_vol'].idxmax()]
+        vol_min_row = df_history.loc[df_history['pcr_vol'].idxmin()]
+        vel_max_row = df_history.loc[df_history['macro_velocity'].idxmax()]
+        vel_min_row = df_history.loc[df_history['macro_velocity'].idxmin()]
+        intra_max_row = df_history.loc[df_history['intraday_velocity'].idxmax()]
+        intra_min_row = df_history.loc[df_history['intraday_velocity'].idxmin()]
+
+        t_oi_max, t_oi_min = f"{oi_max_row['pcr_oi']} ({oi_max_row['timestamp'].strftime('%H:%M')})", f"{oi_min_row['pcr_oi']} ({oi_min_row['timestamp'].strftime('%H:%M')})"
+        t_chg_max, t_chg_min = f"{chg_max_row['pcr_chg']} ({chg_max_row['timestamp'].strftime('%H:%M')})", f"{chg_min_row['pcr_chg']} ({chg_min_row['timestamp'].strftime('%H:%M')})"
+        t_vol_max, t_vol_min = f"{vol_max_row['pcr_vol']} ({vol_max_row['timestamp'].strftime('%H:%M')})", f"{vol_min_row['pcr_vol']} ({vol_min_row['timestamp'].strftime('%H:%M')})"
+        t_vel_max, t_vel_min = f"{vel_max_row['macro_velocity']}x ({vel_max_row['timestamp'].strftime('%H:%M')})", f"{vel_min_row['macro_velocity']}x ({vel_min_row['timestamp'].strftime('%H:%M')})"
+        t_intra_max, t_intra_min = f"{intra_max_row['intraday_velocity']}x ({intra_max_row['timestamp'].strftime('%H:%M')})", f"{intra_min_row['intraday_velocity']}x ({intra_min_row['timestamp'].strftime('%H:%M')})"
+    else:
+        now_str = datetime.now(ist).strftime("%H:%M")
+        t_oi_max = t_oi_min = f"{metrics['pcr_oi']} ({now_str})"
+        t_chg_max = t_chg_min = f"{metrics['pcr_chg']} ({now_str})"
+        t_vol_max = t_vol_min = f"{metrics['pcr_vol']} ({now_str})"
+        t_vel_max = t_vel_min = f"{metrics['vol_oi_velocity']}x ({now_str})"
+        t_intra_max = t_intra_min = f"{metrics['intra_vol_oi_velocity']}x ({now_str})"
 
     # Metrics Overview
     m1, m2 = st.columns(2)
@@ -431,27 +418,27 @@ if metrics:
     with o1:
         st.metric("Total PCR (OI)", metrics['pcr_oi'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Calls: {metrics['total_ce_oi']:,.0f} <br> Puts: {metrics['total_pe_oi']:,.0f}</span>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['oi_max']['val']} ({tracker['oi_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['oi_min']['val']} ({tracker['oi_min']['time']})</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_oi_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_oi_min}</span>", unsafe_allow_html=True)
         
     with o2:
         st.metric("Intraday PCR (OI Change)", metrics['pcr_chg'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Add: {metrics['total_ce_oi_chg']:,.0f} <br> Put Add: {metrics['total_pe_oi_chg']:,.0f}</span>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['chg_max']['val']} ({tracker['chg_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['chg_min']['val']} ({tracker['chg_min']['time']})</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_chg_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_chg_min}</span>", unsafe_allow_html=True)
         
     with o3:
         st.metric("Volume PCR", metrics['pcr_vol'])
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Vol: {metrics['total_ce_vol']:,.0f} <br> Put Vol: {metrics['total_pe_vol']:,.0f}</span>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['vol_max']['val']} ({tracker['vol_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['vol_min']['val']} ({tracker['vol_min']['time']})</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_vol_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_vol_min}</span>", unsafe_allow_html=True)
         
     with o4:
         st.metric("Macro Vol/OI Velocity", f"{metrics['vol_oi_velocity']}x")
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Overall Market Direction</span><br>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['vel_max']['val']}x ({tracker['vel_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['vel_min']['val']}x ({tracker['vel_min']['time']})</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_vel_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_vel_min}</span>", unsafe_allow_html=True)
 
     with o5:
         st.metric("Intraday Vol/OI Velocity", f"{metrics['intra_vol_oi_velocity']}x")
         st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Pure Intraday Intensity</span><br>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {tracker['intra_vel_max']['val']}x ({tracker['intra_vel_max']['time']})</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {tracker['intra_vel_min']['val']}x ({tracker['intra_vel_min']['time']})</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_intra_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_intra_min}</span>", unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### Statistical Boundaries")
@@ -461,52 +448,43 @@ if metrics:
     s3.warning(f"**+1.0 SD:** {metrics['sd1_upper']}")
     s4.warning(f"**+2.0 SD:** {metrics['sd2_upper']}")
 
-   # ==========================================
-    # PCR TRENDS OVER TIME (POLISHED SENTIMENT CHARTS)
+    # ==========================================
+    # PCR TRENDS OVER TIME (QUERIED FROM POSTGRESQL)
     # ==========================================
     st.markdown("---")
-    st.markdown("### 📈 PCR Sentiment & Flow Trends")
+    st.markdown("### 📈 PCR Sentiment & Flow Trends (DB Session)")
 
-    df_pcr = pd.DataFrame(st.session_state.pcr_history)
-    
-    if not df_pcr.empty:
-        # Create a display copy to clean and bound values for visual clarity
-        df_plot = df_pcr.copy()
-        
-        # Clip Intraday PCR display to avoid erratic zero-division spikes (-0.5 to 3.0)
-        df_plot["pcr_chg_clamped"] = df_plot["pcr_chg"].clip(lower=-0.5, upper=3.0)
+    if not df_history.empty:
+        df_plot = df_history.copy()
+        df_plot["pcr_chg_clamped"] = df_plot["pcr_chg"].astype(float).clip(lower=-0.5, upper=3.0)
 
         col_pcr1, col_pcr2 = st.columns(2)
 
-        # 1. TOTAL PCR (OI MACRO)
+        # 1. Total PCR (OI Macro)
         with col_pcr1:
             fig_pcr_oi = go.Figure()
 
-            # Green Bullish Area Fill (> 1.0)
             fig_pcr_oi.add_hrect(
                 y0=1.0, y1=2.5, fillcolor="rgba(76, 175, 80, 0.08)",
                 layer="below", line_width=0, annotation_text="BULLISH SUPPORT (>1.0)",
                 annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
             )
-            # Red Bearish Area Fill (< 1.0)
             fig_pcr_oi.add_hrect(
                 y0=0.0, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
                 layer="below", line_width=0, annotation_text="BEARISH RESISTANCE (<1.0)",
                 annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
             )
 
-            # Trend line
             fig_pcr_oi.add_trace(go.Scatter(
-                x=df_plot["time"],
+                x=df_plot["timestamp"],
                 y=df_plot["pcr_oi"],
                 mode="lines+markers",
                 name="Total PCR",
                 line=dict(color="#00E5FF", width=2.5),
-                marker=dict(size=5, color="#FFFFFF", line=dict(color="#00E5FF", width=1.5)),
+                marker=dict(size=4, color="#FFFFFF", line=dict(color="#00E5FF", width=1.5)),
                 hovertemplate="Time: %{x|%H:%M}<br>Total PCR: <b>%{y:.2f}</b><extra></extra>"
             ))
 
-            # Neutral Level
             fig_pcr_oi.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
 
             fig_pcr_oi.update_layout(
@@ -522,37 +500,32 @@ if metrics:
             )
             st.plotly_chart(fig_pcr_oi, use_container_width=True)
 
-        # 2. INTRADAY PCR (OI CHANGE FLOW)
+        # 2. Intraday PCR (OI Change Flow)
         with col_pcr2:
             fig_pcr_chg = go.Figure()
 
-            # Green Bullish Area Fill (> 1.0)
             fig_pcr_chg.add_hrect(
                 y0=1.0, y1=3.0, fillcolor="rgba(76, 175, 80, 0.08)",
                 layer="below", line_width=0, annotation_text="AGGRESSIVE PUT WRITING (>1.0)",
                 annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
             )
-            # Red Bearish Area Fill (< 1.0)
             fig_pcr_chg.add_hrect(
                 y0=-0.5, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
                 layer="below", line_width=0, annotation_text="AGGRESSIVE CALL WRITING (<1.0)",
                 annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
             )
 
-            # Trend line
             fig_pcr_chg.add_trace(go.Scatter(
-                x=df_plot["time"],
+                x=df_plot["timestamp"],
                 y=df_plot["pcr_chg_clamped"],
                 mode="lines+markers",
                 name="Intraday PCR",
                 line=dict(color="#FFB300", width=2.5),
-                marker=dict(size=5, color="#FFFFFF", line=dict(color="#FFB300", width=1.5)),
+                marker=dict(size=4, color="#FFFFFF", line=dict(color="#FFB300", width=1.5)),
                 hovertemplate="Time: %{x|%H:%M}<br>Intraday PCR: <b>%{y:.2f}</b><extra></extra>"
             ))
 
-            # Neutral Level
             fig_pcr_chg.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
-            # Zero baseline to distinguish unwinding from simple bias
             fig_pcr_chg.add_hline(y=0.0, line_dash="dot", line_color="#78909C", line_width=1)
 
             fig_pcr_chg.update_layout(
@@ -567,6 +540,9 @@ if metrics:
                 hovermode="x unified"
             )
             st.plotly_chart(fig_pcr_chg, use_container_width=True)
+    else:
+        st.info("No recorded database snapshots found for today's session yet.")
+
     # ==========================================
     # CHART RENDERING HELPERS
     # ==========================================
@@ -625,7 +601,7 @@ if metrics:
     )
     st.plotly_chart(fig_strike, use_container_width=True)
 
-    # Restored Bar Charts for OI Change & Volume
+    # Grouped Bar Charts for OI Change & Volume
     st.markdown("---")
     st.markdown(f"### 📊 OI Change on {today_str}")
     render_grouped_bar_chart(f"OI Change on {today_str}", 'pe_oi_chg', 'ce_oi_chg', 'OI Change')
