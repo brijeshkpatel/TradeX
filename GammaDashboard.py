@@ -166,7 +166,7 @@ strike_depth = st.sidebar.slider(
     "🎯 Strike Range (± Points)",
     min_value=100,
     max_value=1000,
-    value=400,
+    value=500,
     step=50,
     help="Restricts ALL calculations to this specific zone."
 )
