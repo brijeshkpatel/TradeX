@@ -119,7 +119,6 @@ def get_db_row_count():
         return 0
 
 def fetch_today_records():
-    """Fetches all snapshot rows recorded today, converted to Asia/Kolkata timezone."""
     try:
         conn = get_db_connection()
         query = """
@@ -267,6 +266,17 @@ def process_data():
         pe_prev_oi = extract_val(pe, ["previous_oi", "prev_oi", "p_oi"]) or 0.0
         api_ce_chg = extract_val(ce, ["change_in_oi", "chng_in_oi", "oi_change"])
         api_pe_chg = extract_val(pe, ["change_in_oi", "chng_in_oi", "oi_change"])
+        
+        # Extract Greeks
+        ce_greeks = ce.get("greeks", {}) if isinstance(ce, dict) else {}
+        pe_greeks = pe.get("greeks", {}) if isinstance(pe, dict) else {}
+        ce_delta = extract_val(ce_greeks, ["delta"]) or 0.0
+        pe_delta = extract_val(pe_greeks, ["delta"]) or 0.0
+        
+        # Calculate Delta Exposures (in Crores)
+        ce_exp = (ce_oi * ce_delta * strike) / 10000000
+        pe_exp = (pe_oi * pe_delta * strike) / 10000000
+        net_exp = ce_exp + pe_exp
 
         if api_ce_chg is not None and api_ce_chg != 0:
             ce_chg = api_ce_chg
@@ -303,7 +313,12 @@ def process_data():
             "pe_oi_chg": pe_chg,
             "ce_vol": ce_vol,
             "pe_vol": pe_vol,
-            "net_writer_delta": pe_chg - ce_chg
+            "net_writer_delta": pe_chg - ce_chg,
+            "ce_delta": ce_delta,
+            "pe_delta": pe_delta,
+            "ce_exp": ce_exp,
+            "pe_exp": pe_exp,
+            "net_exp": net_exp
         })
 
     atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 14.0
@@ -366,7 +381,7 @@ if metrics and is_market_open:
 # Fetch chronological data straight from DB for today's session
 df_history = fetch_today_records()
 
-# Robust Fallback: Determine whether to display Live API data or PostgreSQL snapshot
+# Robust Fallback
 display_data = None
 is_fallback = False
 
@@ -419,66 +434,78 @@ with col_h2:
 # 6. DASHBOARD METRICS & CHARTS RENDERING
 # ==========================================
 if display_data:
-    # Compute high/low extrema dynamically from DB records if present
     if not df_history.empty:
         oi_max_row = df_history.loc[df_history['pcr_oi'].idxmax()]
         oi_min_row = df_history.loc[df_history['pcr_oi'].idxmin()]
         chg_max_row = df_history.loc[df_history['pcr_chg'].idxmax()]
         chg_min_row = df_history.loc[df_history['pcr_chg'].idxmin()]
-        vol_max_row = df_history.loc[df_history['pcr_vol'].idxmax()]
-        vol_min_row = df_history.loc[df_history['pcr_vol'].idxmin()]
-        vel_max_row = df_history.loc[df_history['macro_velocity'].idxmax()]
-        vel_min_row = df_history.loc[df_history['macro_velocity'].idxmin()]
-        intra_max_row = df_history.loc[df_history['intraday_velocity'].idxmax()]
-        intra_min_row = df_history.loc[df_history['intraday_velocity'].idxmin()]
-
+        
         t_oi_max, t_oi_min = f"{oi_max_row['pcr_oi']} ({oi_max_row['timestamp'].strftime('%H:%M')})", f"{oi_min_row['pcr_oi']} ({oi_min_row['timestamp'].strftime('%H:%M')})"
         t_chg_max, t_chg_min = f"{chg_max_row['pcr_chg']} ({chg_max_row['timestamp'].strftime('%H:%M')})", f"{chg_min_row['pcr_chg']} ({chg_min_row['timestamp'].strftime('%H:%M')})"
-        t_vol_max, t_vol_min = f"{vol_max_row['pcr_vol']} ({vol_max_row['timestamp'].strftime('%H:%M')})", f"{vol_min_row['pcr_vol']} ({vol_min_row['timestamp'].strftime('%H:%M')})"
-        t_vel_max, t_vel_min = f"{vel_max_row['macro_velocity']}x ({vel_max_row['timestamp'].strftime('%H:%M')})", f"{vel_min_row['macro_velocity']}x ({vel_min_row['timestamp'].strftime('%H:%M')})"
-        t_intra_max, t_intra_min = f"{intra_max_row['intraday_velocity']}x ({intra_max_row['timestamp'].strftime('%H:%M')})", f"{intra_min_row['intraday_velocity']}x ({intra_min_row['timestamp'].strftime('%H:%M')})"
     else:
         now_str = display_data['timestamp'].strftime("%H:%M")
         t_oi_max = t_oi_min = f"{display_data['pcr_oi']} ({now_str})"
         t_chg_max = t_chg_min = f"{display_data['pcr_chg']} ({now_str})"
-        t_vol_max = t_vol_min = f"{display_data['pcr_vol']} ({now_str})"
-        t_vel_max = t_vel_min = f"{display_data['vol_oi_velocity']}x ({now_str})"
-        t_intra_max = t_intra_min = f"{display_data['intra_vol_oi_velocity']}x ({now_str})"
 
-    # Spot & Writer Overview
     m1, m2 = st.columns(2)
     m1.metric("Nifty Spot", f"{display_data['spot']:.2f}")
     m2.metric("Session Writer Delta", f"{display_data['net_writer_delta']/100000:+.2f}L")
 
+    # ==========================================
+    # DELTA EXPOSURE SECTION (NEW)
+    # ==========================================
+    st.markdown("---")
+    st.markdown("### 🎯 Institutional Delta Exposure Levels")
+    
+    df_strikes = display_data["strike_df"].copy()
+    
+    # Calculate peaks safely if net_exp exists in current dataframe
+    if not df_strikes.empty and 'net_exp' in df_strikes.columns:
+        peak_pos = df_strikes.loc[df_strikes['net_exp'].idxmax()]
+        peak_neg = df_strikes.loc[df_strikes['net_exp'].idxmin()]
+        call_res = df_strikes.loc[df_strikes['ce_exp'].idxmax()]
+        put_sup = df_strikes.loc[df_strikes['pe_exp'].idxmin()]
+        
+        df_strikes['prev_net'] = df_strikes['net_exp'].shift(1)
+        flip_rows = df_strikes[(df_strikes['prev_net'] < 0) & (df_strikes['net_exp'] > 0)]
+        delta_flip_strike = flip_rows.iloc[0]['strike'] if not flip_rows.empty else "None"
+        
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Peak Positive (+Delta exp)", f"{peak_pos['strike']}", f"{peak_pos['net_exp']:,.2f} Cr")
+        d2.metric("Peak Negative (-Delta exp)", f"{peak_neg['strike']}", f"{peak_neg['net_exp']:,.2f} Cr", delta_color="inverse")
+        d3.metric("Call Resistance", f"{call_res['strike']}", f"{call_res['ce_exp']:,.2f} Cr")
+        d4.metric("Put Support", f"{put_sup['strike']}", f"{put_sup['pe_exp']:,.2f} Cr", delta_color="inverse")
+        d5.metric("Delta Flip Strike", f"{delta_flip_strike}", "Trend Reversal", delta_color="off")
+        
+        # Exposure Chart
+        fig_exp = go.Figure()
+        fig_exp.add_trace(go.Bar(x=df_strikes['strike'], y=df_strikes['ce_exp'], name='Call Exposure', marker_color='#F44336'))
+        fig_exp.add_trace(go.Bar(x=df_strikes['strike'], y=df_strikes['pe_exp'], name='Put Exposure', marker_color='#4CAF50'))
+        fig_exp.add_trace(go.Scatter(x=df_strikes['strike'], y=df_strikes['net_exp'], mode='lines+markers', name='Net Exposure', line=dict(color='#FFB300', width=3)))
+        
+        fig_exp.add_vline(x=display_data["spot"], line_dash="dash", line_color="#E0E0E0", annotation_text=f"Spot {display_data['spot']:.2f}", annotation_position="top")
+        
+        fig_exp.update_layout(
+            barmode='relative', height=400, template="plotly_dark",
+            margin=dict(l=40, r=40, t=20, b=20),
+            xaxis=dict(title="Strike", showgrid=True, gridcolor="#263238"),
+            yaxis=dict(title="Exposure (Cr)", showgrid=True, gridcolor="#263238"),
+            hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_exp, use_container_width=True)
+
     st.markdown("---")
     # Broad Market Order Flow
     st.markdown(f"### Broad Market Order Flow (±{strike_depth} Active Zone)")
-    o1, o2, o3, o4, o5 = st.columns(5)
+    o1, o2 = st.columns(2)
     
     with o1:
         st.metric("Total PCR (OI)", display_data['pcr_oi'])
-        st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Calls: {display_data['total_ce_oi']:,.0f} <br> Puts: {display_data['total_pe_oi']:,.0f}</span>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_oi_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_oi_min}</span>", unsafe_allow_html=True)
         
     with o2:
         st.metric("Intraday PCR (OI Change)", display_data['pcr_chg'])
-        st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Add: {display_data['total_ce_oi_chg']:,.0f} <br> Put Add: {display_data['total_pe_oi_chg']:,.0f}</span>", unsafe_allow_html=True)
         st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_chg_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_chg_min}</span>", unsafe_allow_html=True)
-        
-    with o3:
-        st.metric("Volume PCR", display_data['pcr_vol'])
-        st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Call Vol: {display_data['total_ce_vol']:,.0f} <br> Put Vol: {display_data['total_pe_vol']:,.0f}</span>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_vol_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_vol_min}</span>", unsafe_allow_html=True)
-        
-    with o4:
-        st.metric("Macro Vol/OI Velocity", f"{display_data['vol_oi_velocity']}x")
-        st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Overall Market Direction</span><br>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_vel_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_vel_min}</span>", unsafe_allow_html=True)
-
-    with o5:
-        st.metric("Intraday Vol/OI Velocity", f"{display_data['intra_vol_oi_velocity']}x")
-        st.markdown(f"<span style='color:grey; font-size: 0.85rem;'>Pure Intraday Intensity</span><br>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#4CAF50; font-size: 0.8rem;'>High: {t_intra_max}</span> &nbsp;|&nbsp; <span style='color:#F44336; font-size: 0.8rem;'>Low: {t_intra_min}</span>", unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### Statistical Boundaries")
@@ -500,154 +527,33 @@ if display_data:
 
         col_pcr1, col_pcr2 = st.columns(2)
 
-        # 1. Total PCR (OI Macro)
         with col_pcr1:
             fig_pcr_oi = go.Figure()
-
-            fig_pcr_oi.add_hrect(
-                y0=1.0, y1=2.5, fillcolor="rgba(76, 175, 80, 0.08)",
-                layer="below", line_width=0, annotation_text="BULLISH SUPPORT (>1.0)",
-                annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
-            )
-            fig_pcr_oi.add_hrect(
-                y0=0.0, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
-                layer="below", line_width=0, annotation_text="BEARISH RESISTANCE (<1.0)",
-                annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
-            )
-
-            fig_pcr_oi.add_trace(go.Scatter(
-                x=df_plot["timestamp"],
-                y=df_plot["pcr_oi"],
-                mode="lines+markers",
-                name="Total PCR",
-                line=dict(color="#00E5FF", width=2.5),
-                marker=dict(size=4, color="#FFFFFF", line=dict(color="#00E5FF", width=1.5)),
-                hovertemplate="Time: %{x|%H:%M}<br>Total PCR: <b>%{y:.2f}</b><extra></extra>"
-            ))
-
-            fig_pcr_oi.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
-
-            fig_pcr_oi.update_layout(
-                title=dict(text="<b>Macro PCR (Total OI)</b>", font=dict(size=15, color="#FFFFFF")),
-                height=360,
-                template="plotly_dark",
-                paper_bgcolor="rgba(15, 23, 42, 0.6)",
-                plot_bgcolor="rgba(15, 23, 42, 0.6)",
-                margin=dict(l=40, r=40, t=50, b=30),
-                xaxis=dict(title="Time (IST)", tickformat="%H:%M", showgrid=True, gridcolor="#263238"),
-                yaxis=dict(title="PCR (OI)", range=[0.4, 2.0], showgrid=True, gridcolor="#263238"),
-                hovermode="x unified"
-            )
+            fig_pcr_oi.add_trace(go.Scatter(x=df_plot["timestamp"], y=df_plot["pcr_oi"], mode="lines+markers", line=dict(color="#00E5FF", width=2.5)))
+            fig_pcr_oi.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0")
+            fig_pcr_oi.update_layout(title="Macro PCR (Total OI)", height=300, template="plotly_dark", margin=dict(l=40, r=40, t=50, b=30))
             st.plotly_chart(fig_pcr_oi, use_container_width=True)
 
-        # 2. Intraday PCR (OI Change Flow)
         with col_pcr2:
             fig_pcr_chg = go.Figure()
-
-            fig_pcr_chg.add_hrect(
-                y0=1.0, y1=3.0, fillcolor="rgba(76, 175, 80, 0.08)",
-                layer="below", line_width=0, annotation_text="AGGRESSIVE PUT WRITING (>1.0)",
-                annotation_position="top right", annotation_font=dict(color="#4CAF50", size=10)
-            )
-            fig_pcr_chg.add_hrect(
-                y0=-0.5, y1=1.0, fillcolor="rgba(244, 67, 54, 0.08)",
-                layer="below", line_width=0, annotation_text="AGGRESSIVE CALL WRITING (<1.0)",
-                annotation_position="bottom right", annotation_font=dict(color="#F44336", size=10)
-            )
-
-            fig_pcr_chg.add_trace(go.Scatter(
-                x=df_plot["timestamp"],
-                y=df_plot["pcr_chg_clamped"],
-                mode="lines+markers",
-                name="Intraday PCR",
-                line=dict(color="#FFB300", width=2.5),
-                marker=dict(size=4, color="#FFFFFF", line=dict(color="#FFB300", width=1.5)),
-                hovertemplate="Time: %{x|%H:%M}<br>Intraday PCR: <b>%{y:.2f}</b><extra></extra>"
-            ))
-
-            fig_pcr_chg.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0", line_width=1.5)
-            fig_pcr_chg.add_hline(y=0.0, line_dash="dot", line_color="#78909C", line_width=1)
-
-            fig_pcr_chg.update_layout(
-                title=dict(text="<b>Intraday Flow PCR (OI Change)</b>", font=dict(size=15, color="#FFFFFF")),
-                height=360,
-                template="plotly_dark",
-                paper_bgcolor="rgba(15, 23, 42, 0.6)",
-                plot_bgcolor="rgba(15, 23, 42, 0.6)",
-                margin=dict(l=40, r=40, t=50, b=30),
-                xaxis=dict(title="Time (IST)", tickformat="%H:%M", showgrid=True, gridcolor="#263238"),
-                yaxis=dict(title="PCR (OI Change)", range=[-0.2, 2.5], showgrid=True, gridcolor="#263238"),
-                hovermode="x unified"
-            )
+            fig_pcr_chg.add_trace(go.Scatter(x=df_plot["timestamp"], y=df_plot["pcr_chg_clamped"], mode="lines+markers", line=dict(color="#FFB300", width=2.5)))
+            fig_pcr_chg.add_hline(y=1.0, line_dash="dash", line_color="#E0E0E0")
+            fig_pcr_chg.update_layout(title="Intraday Flow PCR (OI Change)", height=300, template="plotly_dark", margin=dict(l=40, r=40, t=50, b=30))
             st.plotly_chart(fig_pcr_chg, use_container_width=True)
-    else:
-        st.info("No recorded database snapshots found for today's session yet.")
 
     # ==========================================
     # 7. STRIKE DISTRIBUTION CHARTS
     # ==========================================
-    df_strikes = display_data["strike_df"]
     spot_val = display_data["spot"]
-    today_str = datetime.now(ist).strftime("%a, %d %b")
-
-    def render_grouped_bar_chart(title, y_col_pe, y_col_ce, y_label):
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=df_strikes['strike'], y=df_strikes[y_col_pe] / 100000.0, name=f'Put {y_label}', marker_color='#4CAF50',
-            hovertemplate=f'Strike: %{{x}}<br>Put {y_label}: %{{y:.2f}}L<extra></extra>'
-        ))
-        fig.add_trace(go.Bar(
-            x=df_strikes['strike'], y=df_strikes[y_col_ce] / 100000.0, name=f'Call {y_label}', marker_color='#F44336',
-            hovertemplate=f'Strike: %{{x}}<br>Call {y_label}: %{{y:.2f}}L<extra></extra>'
-        ))
-        fig.add_vline(
-            x=spot_val, line_width=2, line_dash="dash", line_color="#424242",
-            annotation_text=f"NIFTY {spot_val:.2f}", annotation_position="top",
-            annotation_font=dict(size=13, color="black"), annotation_bgcolor="#EEEEEE"
-        )
-        fig.update_layout(
-            barmode='group', height=400, template="plotly_white", margin=dict(l=40, r=40, t=40, b=40),
-            xaxis=dict(title="Strike", tickmode='array', tickvals=df_strikes['strike'], tickangle=-45, showgrid=True, gridcolor='#f0f0f0'),
-            yaxis=dict(title=f"{y_label} (Lakhs)", ticksuffix="L", showgrid=True, gridcolor='#f0f0f0'),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Strike-Wise Net Writing Distribution Chart
+    
     st.markdown("---")
-    st.markdown(f"### 📌 Current Strike-Wise Writer Dominance (±{strike_depth} Points)")
+    st.markdown(f"### 📌 Current Strike-Wise Writer Dominance")
     fig_strike = go.Figure()
     bar_colors = ["#4CAF50" if x >= 0 else "#F44336" for x in df_strikes["net_writer_delta"]]
-
-    fig_strike.add_trace(go.Bar(
-        x=df_strikes["strike"],
-        y=df_strikes["net_writer_delta"] / 100000.0,
-        marker_color=bar_colors,
-        name="Net Put - Call Add",
-        hovertemplate="Strike: %{x}<br>Net Delta: %{y:.2f}L<extra></extra>"
-    ))
-
-    fig_strike.add_vline(
-        x=spot_val, line_width=2, line_dash="dash", line_color="#424242",
-        annotation_text=f"NIFTY {spot_val:.2f}", annotation_position="top"
-    )
-
-    fig_strike.update_layout(
-        height=380, template="plotly_white", margin=dict(l=40, r=40, t=20, b=30),
-        xaxis=dict(title="Strike", tickmode="array", tickvals=df_strikes["strike"], tickangle=-45, showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(title="Net Writer Delta (Lakhs)", showgrid=True, gridcolor="#f0f0f0", zeroline=True, zerolinecolor="#000000"),
-        hovermode="x unified"
-    )
+    fig_strike.add_trace(go.Bar(x=df_strikes["strike"], y=df_strikes["net_writer_delta"] / 100000.0, marker_color=bar_colors, name="Net Put - Call Add"))
+    fig_strike.add_vline(x=spot_val, line_dash="dash", line_color="#424242", annotation_text=f"NIFTY {spot_val:.2f}")
+    fig_strike.update_layout(height=380, template="plotly_white", margin=dict(l=40, r=40, t=20, b=30))
     st.plotly_chart(fig_strike, use_container_width=True)
-
-    # Grouped Bar Charts for OI Change & Volume
-    st.markdown("---")
-    st.markdown(f"### 📊 OI Change on {today_str}")
-    render_grouped_bar_chart(f"OI Change on {today_str}", 'pe_oi_chg', 'ce_oi_chg', 'OI Change')
-
-    st.markdown(f"### 📊 Total Volume on {today_str}")
-    render_grouped_bar_chart(f"Total Volume on {today_str}", 'pe_vol', 'ce_vol', 'Volume')
 
 # ==========================================
 # 8. REFRESH LOOP
